@@ -1,5 +1,23 @@
 # API Documentation
 
+## Local Development Setup
+
+1. Install Node.js and npm from [https://nodejs.org/](https://nodejs.org/)
+
+2. Install project dependencies:
+
+```bash
+npm install
+```
+
+3. Start the development server:
+
+```bash
+npm run dev
+```
+
+The server will start at `http://localhost:9000`.
+
 ## Base URL
 
 The base URL for all API endpoints is: `http://localhost:9000` (development) or your production domain.
