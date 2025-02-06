@@ -86,7 +86,7 @@ const handleUploadError = (
   } as ErrorResponse);
 };
 
-// File upload route
+// Multiple file upload route
 router.post(
   "/video-upload",
   uploadLimiter,
@@ -94,58 +94,88 @@ router.post(
   async (req: Request, res: Response): Promise<void> => {
     const user = await User.findById(req.user._id);
     if (!user) {
-      res.status(404).json({
-        error: "User not found",
-      } as ErrorResponse);
+      res.status(404).json({ error: "User not found" } as ErrorResponse);
       return;
     }
 
-    upload.single("file")(req, res, async (err) => {
+    // Get max files from header, default to 10 if not specified
+    const maxFiles = parseInt(req.headers["x-max-files"] as string) || 10;
+
+    // Use a single upload handler that can handle both single and multiple files
+    upload.array("files", maxFiles)(req, res, async (err) => {
       if (err) {
+        if (err.code === "LIMIT_UNEXPECTED_FILE") {
+          // If files field fails, try single file upload
+          upload.single("file")(req, res, async (singleErr) => {
+            if (singleErr) {
+              console.error("Multer error:", singleErr);
+              handleUploadError(singleErr, req, res, () => {});
+              return;
+            }
+            if (!req.file) {
+              res.status(400).json({
+                error:
+                  "No file uploaded. Use 'file' for single or 'files' for multiple uploads.",
+              } as ErrorResponse);
+              return;
+            }
+            await handleSuccessfulUpload([req.file], user, res);
+          });
+          return;
+        }
         console.error("Multer error:", err);
         handleUploadError(err, req, res, () => {});
         return;
       }
 
-      if (!req.file) {
+      const files = req.files as Express.Multer.File[];
+      if (!files || !files.length) {
         res.status(400).json({
           error:
-            "No file uploaded. Make sure you're sending the file with the key 'file'",
+            "No files uploaded. Use 'file' for single or 'files' for multiple uploads.",
         } as ErrorResponse);
         return;
       }
-
-      try {
-        // Generate public URL for the uploaded file
-        const publicUrl = `https://storage.googleapis.com/${
-          config.gcp.bucketName
-        }/${encodeURIComponent(req.file.filename)}`;
-
-        const video = new Video({
-          title: req.file.originalname,
-          link: publicUrl,
-          company: user.company,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-        });
-
-        await video.save();
-
-        res.json({
-          message: "File uploaded successfully",
-          fileUrl: publicUrl,
-          filename: req.file.originalname,
-          size: req.file.size,
-          mimetype: req.file.mimetype,
-        });
-      } catch (error) {
-        console.error("Error saving file details to database:", error);
-        res.status(500).json({
-          error: "Failed to save file details to database",
-        } as ErrorResponse);
-      }
+      await handleSuccessfulUpload(files, user, res);
     });
   }
 );
+
+// Helper function to handle successful upload
+async function handleSuccessfulUpload(
+  files: Express.Multer.File[],
+  user: any,
+  res: Response
+) {
+  try {
+    const uploadedFiles = files.map((file) => {
+      const publicUrl = `https://storage.googleapis.com/${
+        config.gcp.bucketName
+      }/${encodeURIComponent(file.filename)}`;
+      return {
+        title: file.originalname,
+        link: publicUrl,
+        company: user.company,
+        mimetype: file.mimetype,
+        size: file.size,
+      };
+    });
+
+    await Video.insertMany(uploadedFiles);
+
+    res.json({
+      message:
+        files.length > 1
+          ? "Files uploaded successfully"
+          : "File uploaded successfully",
+      files: uploadedFiles,
+    });
+  } catch (error) {
+    console.error("Error saving file details to database:", error);
+    res.status(500).json({
+      error: "Failed to save file details to database",
+    } as ErrorResponse);
+  }
+}
 
 export default router;
