@@ -7,6 +7,7 @@ import rateLimit from "express-rate-limit";
 import { authenticateUser } from "../middleware/auth";
 import User from "../models/User";
 import Image from "../models/Image";
+
 const router = Router();
 
 // Rate limiting configuration
@@ -27,57 +28,44 @@ const upload = multer({
     uniformBucketLevelAccess: true,
     acl: "publicRead",
     filename: (req: Request, file: Express.Multer.File, cb: any) => {
+      // Sanitize the filename to remove any problematic characters
+      const sanitizedOriginalname = file.originalname.replace(
+        /[^a-zA-Z0-9.-]/g,
+        "_"
+      );
       const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-      cb(null, `${file.fieldname}-${uniqueSuffix}-${file.originalname}`);
+      // Ensure the file is stored at the root of the bucket without any subfolder
+      cb(null, `${uniqueSuffix}-${sanitizedOriginalname}`);
     },
-    contentType: (req, file) => {
-      console.log("Content type for file:", file.mimetype);
-      return file.mimetype;
-    },
+    contentType: (req, file) => file.mimetype,
   }),
   limits: {
-    fileSize: 15 * 1024 * 1024, // 15MB limit
+    fileSize: 15 * 1024 * 1024, // 15MB limit per file
   },
   fileFilter: (req, file, cb) => {
-    const allowedMimes = [
-      "image/jpeg",
-      "image/png",
-      "image/gif",
-      "application/pdf",
-    ];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Invalid file type"));
-    }
+    const allowedMimes = ["image/jpeg", "image/png", "image/gif"];
+    allowedMimes.includes(file.mimetype)
+      ? cb(null, true)
+      : cb(new Error("Invalid file type"));
   },
 });
 
 // Handle file upload errors
-const handleUploadError = (
-  error: any,
-  req: Request,
-  res: Response,
-  next: Function
-) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({
-        error: "File size exceeds limit of 15MB",
-      } as ErrorResponse);
-    }
+const handleUploadError = (error: any, req: Request, res: Response) => {
+  if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+    return res
+      .status(400)
+      .json({ error: "File size exceeds limit of 15MB" } as ErrorResponse);
   }
   if (error.message === "Invalid file type") {
     return res.status(400).json({
       error: "Invalid file type. Allowed types: JPEG, PNG, GIF, PDF",
     } as ErrorResponse);
   }
-  return res.status(500).json({
-    error: "File upload failed",
-  } as ErrorResponse);
+  return res.status(500).json({ error: "File upload failed" } as ErrorResponse);
 };
 
-// File upload route
+// Multiple file upload route
 router.post(
   "/image-upload",
   uploadLimiter,
@@ -85,58 +73,88 @@ router.post(
   async (req: Request, res: Response): Promise<void> => {
     const user = await User.findById(req.user._id);
     if (!user) {
-      res.status(404).json({
-        error: "User not found",
-      } as ErrorResponse);
+      res.status(404).json({ error: "User not found" } as ErrorResponse);
       return;
     }
 
-    upload.single("file")(req, res, async (err) => {
+    // Get max files from header, default to 10 if not specified
+    const maxFiles = parseInt(req.headers["x-max-files"] as string) || 10;
+
+    // Use a single upload handler that can handle both single and multiple files
+    upload.array("files", maxFiles)(req, res, async (err) => {
       if (err) {
+        if (err.code === "LIMIT_UNEXPECTED_FILE") {
+          // If files field fails, try single file upload
+          upload.single("file")(req, res, async (singleErr) => {
+            if (singleErr) {
+              console.error("Multer error:", singleErr);
+              handleUploadError(singleErr, req, res);
+              return;
+            }
+            if (!req.file) {
+              res.status(400).json({
+                error:
+                  "No file uploaded. Use 'file' for single or 'files' for multiple uploads.",
+              } as ErrorResponse);
+              return;
+            }
+            await handleSuccessfulUpload([req.file], user, res);
+          });
+          return;
+        }
         console.error("Multer error:", err);
-        handleUploadError(err, req, res, () => {});
+        handleUploadError(err, req, res);
         return;
       }
 
-      if (!req.file) {
+      const files = req.files as Express.Multer.File[];
+      if (!files || !files.length) {
         res.status(400).json({
           error:
-            "No file uploaded. Make sure you're sending the file with the key 'file'",
+            "No files uploaded. Use 'file' for single or 'files' for multiple uploads.",
         } as ErrorResponse);
         return;
       }
-
-      try {
-        // Generate public URL for the uploaded file
-        const publicUrl = `https://storage.googleapis.com/${
-          config.gcp.bucketName
-        }/${encodeURIComponent(req.file.filename)}`;
-
-        const image = new Image({
-          title: req.file.originalname,
-          link: publicUrl,
-          company: user.company,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-        });
-
-        await image.save();
-
-        res.json({
-          message: "File uploaded successfully",
-          fileUrl: publicUrl,
-          filename: req.file.originalname,
-          size: req.file.size,
-          mimetype: req.file.mimetype,
-        });
-      } catch (error) {
-        console.error("Error saving file details to database:", error);
-        res.status(500).json({
-          error: "Failed to save file details to database",
-        } as ErrorResponse);
-      }
+      await handleSuccessfulUpload(files, user, res);
     });
   }
 );
+
+// Helper function to handle successful upload
+async function handleSuccessfulUpload(
+  files: Express.Multer.File[],
+  user: any,
+  res: Response
+) {
+  try {
+    const uploadedFiles = files.map((file) => {
+      const publicUrl = `https://storage.googleapis.com/${
+        config.gcp.bucketName
+      }/${encodeURIComponent(file.filename)}`;
+      return {
+        title: file.originalname,
+        link: publicUrl,
+        company: user.company,
+        mimetype: file.mimetype,
+        size: file.size,
+      };
+    });
+
+    await Image.insertMany(uploadedFiles);
+
+    res.json({
+      message:
+        files.length > 1
+          ? "Files uploaded successfully"
+          : "File uploaded successfully",
+      files: uploadedFiles,
+    });
+  } catch (error) {
+    console.error("Error saving file details to database:", error);
+    res.status(500).json({
+      error: "Failed to save file details to database",
+    } as ErrorResponse);
+  }
+}
 
 export default router;
